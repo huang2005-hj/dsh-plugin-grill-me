@@ -1,0 +1,16 @@
+# ============================================================================
+# dsh-plugin-grill-me — DSH bundle patch
+# ============================================================================
+# This file is the `dsh.bundle.patch` layer of the package: when the plugin is
+# installed through the plugin manager, the profile reconciles
+# `dsh.profile.bundles` against the installed packages and merges this patch —
+# a single `insert:` of the plugin row — exactly like a manual mount line in
+# the profile's own cordis.patch.yml. No profile file edits are needed.
+#
+# The row's `name` is the package name the loader resolves from the profile's
+# node_modules, and `id` is the entry id (must be unique in the entry list).
+# ============================================================================
+
+- insert:
+    - id: grill-me
+      name: 'dsh-plugin-grill-me'

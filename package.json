@@ -1,0 +1,19 @@
+{
+  "name": "dsh-plugin-grill-me",
+  "version": "0.3.5",
+  "private": true,
+  "description": "把 mattpocock 的 grill-me / grilling 技能复刻成 DSH 里的确定性访谈状态机：两个技能、一个只读状态工具、逐步注入的 frontier 指令，以及违反协议时把模型拉回来的 turn gate。",
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
