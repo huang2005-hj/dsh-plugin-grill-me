@@ -29,6 +29,38 @@ export const CORRECTION_MARKER = '[[grill-me:correction]]'
 /** Source tag that marks a message as plugin-owned (never a real user reply). */
 export const SOURCE_KIND = 'grill-me'
 
+/**
+ * The user-invoked entry point that switches the documentation channel on.
+ *
+ * Upstream keeps `grill-with-docs` a separate wrapper (`disable-model-invocation`)
+ * around the same `grilling` primitive plus `domain-modeling`. The name is what
+ * separates the two modes here: only an interview armed through this entry point
+ * gets documentation obligations. `grill-me` / `grilling` behave exactly as
+ * before and never talk about documents.
+ */
+export const DOCS_WRAPPER_NAME = 'grill-with-docs'
+
+/** The documentation primitive `grill-with-docs` loads. It never arms alone. */
+export const DOCS_PRIMITIVE_NAME = 'domain-modeling'
+
+/**
+ * Declaration marker the interviewer writes to promise one document.
+ *
+ * `📄 ADR: <title>` books an ADR, `📄 术语: <term>` books a glossary entry. The
+ * machine never decides whether a decision *deserves* an ADR — that is the
+ * model's judgement under upstream's three criteria — it only holds the model to
+ * what it said it would write.
+ */
+export const DOC_MARKER = '📄'
+
+/** `📄 ADR: …` / `📄 术语: …`, in prose, at the start of a line. */
+const DOC_DECL_RE =
+  /(?:^|\n)[ \t]*(?:[-*+][ \t]+)?\*{0,2}📄[ \t]*(ADR|术语)\*{0,2}[ \t]*[:：][ \t]*\*{0,2}([^\n*]{1,200})/g
+
+/** Path argument keys a host uses for a write, in the order they are tried. */
+const PATH_ARG_KEYS = ['file_path', 'filePath', 'path', 'filename', 'fileName', 'target', 'target_file']
+
+
 /** Matches `Q1`, `**Q1**`, `❓ **Q1** - **title**`, `**Q 12**:` and friends. */
 const QUESTION_RE = /(?:^|\n)\s*(?:[^\S\n]*❓)?[^\S\n]*\*{0,2}Q\s?(\d{1,3})\*{0,2}\s*[-–—:：.)、]?/g
 
@@ -84,7 +116,7 @@ const GESTURE_LEAD_MAX = 8
 function isGestureText(text) {
   if (typeof text !== 'string' || text.length === 0) return false
   const speech = text.replace(/\r/g, '')
-  if (/\/(?:grill-me|grilling)\b/i.test(speech)) return true
+  if (/\/(?:grill-me|grilling|grill-with-docs)\b/i.test(speech)) return true
   for (const match of speech.matchAll(new RegExp(GESTURE_TRIGGER_RE.source, 'gi'))) {
     const at = match.index ?? 0
     const lineStart = speech.lastIndexOf('\n', at - 1) + 1
@@ -329,6 +361,7 @@ function projectEvent(entry) {
         deactivation,
         skillInvocation: sourceInvokesSkill(message?.source),
         skillLoad: skillToolRequests(message),
+        skillNames: sourceSkillNames(message?.source),
         toolNames: names,
       }
     }
@@ -341,6 +374,8 @@ function projectEvent(entry) {
         messageId: message?.id,
         source: message?.source ?? { kind: 'model' },
         text,
+        docDecls: parseDocDeclarations(text),
+        writePaths: writePathsOfMessage(message),
         questions: parseQuestions(text),
         recommends: countMatches(text, RECOMMEND_RE),
         installs: parseInstalls(text),
@@ -363,6 +398,7 @@ function projectEvent(entry) {
         name,
         callId: data?.callId,
         skillLoad: name === 'skill' && args && typeof args.name === 'string' ? [args.name] : [],
+        writePaths: writePathsOf(name, args),
       }
     }
     case 'tool/result':
@@ -462,7 +498,18 @@ function tryParseJson(raw) {
 
 /** Whether a skill name refers to this plugin's interview. */
 function isGrillSkillName(name) {
-  return typeof name === 'string' && /^(?:grill-me|grilling)$/i.test(name.trim())
+  return typeof name === 'string' && /^(?:grill-me|grilling|grill-with-docs)$/i.test(name.trim())
+}
+
+/**
+ * Whether a skill name is the documentation entry point.
+ *
+ * Only `grill-with-docs` opens the documentation channel. `domain-modeling` on
+ * its own is a documentation skill, not an interview: loading it inside a plain
+ * `grilling` round must not quietly add obligations the user never asked for.
+ */
+function isDocsSkillName(name) {
+  return typeof name === 'string' && /^grill-with-docs$/i.test(name.trim())
 }
 
 /**
@@ -922,6 +969,120 @@ export function isReadOnlyTool(name) {
   return /^(read|get|list|search|query|inspect|view|show|fetch|stat|find|grep|glob|ls|cat)[_-]/.test(tool)
 }
 
+/* ------------------------------------------------------------------ *
+ * The documentation channel (grill-with-docs)
+ *
+ * Upstream's `domain-modeling` writes a term into `GLOSSARY.md` the moment it
+ * settles and only proposes an ADR when three criteria hold — and its own docs
+ * record the failure mode this channel exists to prevent: "the file write
+ * silently does not happen". A prompt cannot make "as it settles" deterministic,
+ * so the channel adds one machine-readable promise (`📄 ADR: …` / `📄 术语: …`)
+ * and holds the model to it.
+ *
+ * Everything here stays at the transcript layer, exactly like the existing
+ * gates: a declaration is text the model wrote, and a write is a write-tool call
+ * whose arguments name a document path. Nothing reads the disk.
+ * ------------------------------------------------------------------ */
+
+/** Tools whose whole job is writing a file, so they carry a target path. */
+const WRITE_TOOL_RE =
+  /^(?:write|write_?file|create_?file|edit|edit_?file|multi_?edit|str_?replace|replace|replace_?in_?file|apply_?patch|patch|insert|append_?file|save_?file|fs_?write|fs_?edit|notebook_?edit)$/
+
+/** Whether a tool name writes a file. */
+export function isWriteTool(name) {
+  if (typeof name !== 'string') return false
+  return WRITE_TOOL_RE.test(name.trim().toLowerCase())
+}
+
+/**
+ * What kind of document a write target is, or `null` for anything else.
+ *
+ * Upstream's layout, verbatim: an ADR is `docs/adr/NNNN-slug.md`, and a glossary
+ * is always a file named `GLOSSARY.md` (one per context, hence "any path
+ * segment"). Separators are normalized because the transcript carries whatever
+ * the host recorded.
+ */
+export function classifyDocPath(path) {
+  if (typeof path !== 'string' || path.length === 0) return null
+  const normalized = path.replace(/\\/g, '/').toLowerCase()
+  if (/(?:^|\/)docs\/adr\/[^/]+$/.test(normalized)) return 'adr'
+  if (/(?:^|\/)glossary\.md$/.test(normalized)) return 'glossary'
+  return null
+}
+
+/**
+ * Slug of a document title, used to match a declaration against the file that
+ * pays it off.
+ *
+ * ASCII-only on purpose: a title with no ASCII in it yields `''`, which disables
+ * slug matching for that debt — it is then paid by kind alone, which is the
+ * right fallback when a title is Chinese and the file name is up to the model.
+ */
+export function docSlug(title) {
+  return String(title ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+}
+
+/**
+ * Every document one message promised.
+ *
+ * Quoted blocks are stripped first, so a marker inside a fence or a blockquote —
+ * where the protocol is being *quoted* rather than followed — books nothing.
+ */
+export function parseDocDeclarations(text) {
+  if (typeof text !== 'string' || text.length === 0) return []
+  const body = strippedOf(text)
+  const out = []
+  const seen = new Set()
+  for (const match of body.matchAll(DOC_DECL_RE)) {
+    const kind = match[1] === 'ADR' ? 'adr' : 'glossary'
+    const title = match[2].trim().replace(/[.。,，;；:：]+$/, '')
+    if (title.length === 0) continue
+    const key = `${kind}\u0000${title}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ kind, title })
+  }
+  return out
+}
+
+/** The document paths one tool call writes (empty for everything else). */
+function writePathsOf(name, args) {
+  if (!isWriteTool(name) || args === null || typeof args !== 'object') return []
+  const out = []
+  for (const key of PATH_ARG_KEYS) {
+    const value = args[key]
+    if (typeof value === 'string' && value.trim().length > 0) out.push(value.trim())
+  }
+  return out
+}
+
+/** The document paths every tool-call block of one assistant message writes. */
+function writePathsOfMessage(message) {
+  const out = []
+  for (const block of asArray(unwrapMessage(message)?.content)) {
+    if (!isToolBlock(block)) continue
+    const tool = block.name ?? block.toolName
+    const raw = block.arguments ?? block.input ?? block.args
+    const args = typeof raw === 'string' ? tryParseJson(raw) : raw
+    for (const path of writePathsOf(tool, args)) out.push(path)
+  }
+  return out
+}
+
+/** Skill names a message source carries (skill-invocation / catalog / gesture). */
+function sourceSkillNames(source) {
+  if (source === null || typeof source !== 'object') return []
+  const out = []
+  for (const value of [source.name, source.skill, source.command, source.gesture]) {
+    if (typeof value === 'string' && isGrillSkillName(value)) out.push(value.trim())
+  }
+  return out
+}
+
 /** Packages a message tells the user to install. */
 export function parseInstalls(text) {
   if (typeof text !== 'string') return []
@@ -955,6 +1116,10 @@ const EMPTY_STATE = Object.freeze({
   confirmedUnderstanding: false,
   actionsAfterRound: [],
   installs: [],
+  docsMode: false,
+  docDebts: [],
+  openDocDebts: [],
+  docViolations: [],
   claimedDone: false,
   claimedSharedUnderstanding: false,
   evidence: [],
@@ -1121,6 +1286,14 @@ function createFold(start) {
     installs: [],
     evidence: [],
     flaggedSteps: new Set(),
+    // The documentation channel. `docsMode` latches on when the interview is
+    // armed through `grill-with-docs`; `docDebts` is every document the
+    // interviewer declared (`📄 …`) and whether a write paid it off;
+    // `docViolations` records steps that ran on to the work while a debt was
+    // still outstanding.
+    docsMode: false,
+    docDebts: [],
+    docViolations: [],
   }
 }
 
@@ -1289,6 +1462,11 @@ function flagAction(fold, fact, toolNames) {
   const installs = Array.isArray(fact.installs) ? fact.installs : []
   const mutating = toolNames.filter((name) => !isReadOnlyTool(name))
   if (mutating.length === 0 && installs.length === 0) return
+  // grill-with-docs: writing the documents the interview owes is part of the
+  // interview, not acting on the design. Upstream writes a term into the
+  // glossary *as it settles* — while a round is still open — so a step that does
+  // nothing but write document paths must not be corrected for it.
+  if (docsOnlyWrite(fact, mutating)) return
   const open = fold.rounds[fold.rounds.length - 1]
   if (!open || open.answered) return
   const stepKey = `${fact.turn ?? '?'}:${fact.step ?? '?'}`
@@ -1332,6 +1510,107 @@ function restatesNewestRound(fold, questions) {
 }
 
 /**
+ * Whether a step did nothing but write the interview's own documents.
+ *
+ * Both halves are required: every mutating tool call has to be a write tool, and
+ * every path written has to be an ADR or a glossary. One shell command in the
+ * same step, or one write outside those paths, and the step is an ordinary act.
+ */
+function docsOnlyWrite(fact, mutating) {
+  const paths = asArray(fact.writePaths)
+  if (paths.length === 0) return false
+  if (!paths.every((path) => classifyDocPath(path) !== null)) return false
+  return mutating.every((name) => isWriteTool(name))
+}
+
+/** Whether a user fact arms the interview through the documentation entry point. */
+function isDocsActivation(fact) {
+  if (asArray(fact.skillNames).some(isDocsSkillName)) return true
+  if (asArray(fact.skillLoad).some(isDocsSkillName)) return true
+  return /\/grill-with-docs\b/i.test(strippedOf(fact.text ?? ''))
+}
+
+/**
+ * Book the documents one message promised.
+ *
+ * Declaring the same title twice books one debt — the second declaration adds
+ * nothing to write. Declarations in a mode without the channel are ignored:
+ * `grill-me` / `grilling` promise no documents at all.
+ */
+function declareDocs(fold, fact) {
+  if (!fold.docsMode) return
+  for (const decl of asArray(fact.docDecls)) {
+    const existing = fold.docDebts.find((debt) => debt.kind === decl.kind && debt.title === decl.title)
+    if (existing) continue
+    fold.docDebts.push({
+      kind: decl.kind,
+      title: decl.title,
+      slug: docSlug(decl.title),
+      seq: fact.seq,
+      turn: fact.turn,
+      step: fact.step,
+      dischargedAtSeq: undefined,
+      dischargedPath: undefined,
+    })
+    fold.evidence.push({
+      seq: fact.seq,
+      note: `documentation debt declared: ${decl.kind} — ${decl.title}`,
+    })
+  }
+}
+
+/**
+ * Pay off debts from the paths one step wrote.
+ *
+ * Matching is by kind first, then by slug: the interviewer names a title and
+ * chooses the file name, so a path whose slug contains the declared title pays
+ * *that* debt, and otherwise the oldest outstanding one of the same kind does.
+ * Nothing here judges the file's content — the gate is about the write
+ * happening at all, which is the failure upstream's own docs record.
+ */
+function payDocs(fold, fact) {
+  for (const path of asArray(fact.writePaths)) {
+    const kind = classifyDocPath(path)
+    if (kind === null) continue
+    const open = fold.docDebts.filter((debt) => debt.kind === kind && debt.dischargedAtSeq === undefined)
+    if (open.length === 0) continue
+    const slug = docSlug(path)
+    const target = open.find((debt) => debt.slug.length >= 3 && slug.includes(debt.slug)) ?? open[0]
+    target.dischargedAtSeq = fact.seq
+    target.dischargedPath = path
+    fold.evidence.push({ seq: fact.seq, note: `documentation debt paid: ${target.kind} — ${target.title}` })
+  }
+}
+
+/**
+ * Record a step that ran on to the work while documents were still owed.
+ *
+ * This is the half of the gate the directive cannot enforce on its own: if the
+ * model implements with a debt outstanding, `agent/turn-stopping` steers the
+ * same recovery text an unanswered round buys.
+ */
+function flagDocViolation(fold, fact, toolNames) {
+  if (!fold.docsMode) return
+  if (fold.rounds.length === 0) return
+  if (!fold.rounds.every((round) => round.answered)) return
+  const open = fold.docDebts.filter((debt) => debt.dischargedAtSeq === undefined)
+  if (open.length === 0) return
+  const mutating = asArray(toolNames).filter((name) => !isReadOnlyTool(name))
+  if (mutating.length === 0) return
+  if (docsOnlyWrite(fact, mutating)) return
+  const stepKey = `doc:${fact.turn ?? '?'}:${fact.step ?? '?'}`
+  if (fold.flaggedSteps.has(stepKey)) return
+  fold.flaggedSteps.add(stepKey)
+  fold.docViolations.push({
+    seq: fact.seq,
+    turn: fact.turn,
+    step: fact.step,
+    toolNames: mutating,
+    note: `ran on to the work with ${open.length} declared document(s) still unwritten (turn ${fact.turn ?? '?'}, step ${fact.step ?? '?'})`,
+  })
+}
+
+/**
  * Fold one fact into the accumulator.
  *
  * @param fold - the fold accumulator.
@@ -1342,6 +1621,10 @@ function stepFold(fold, fact) {
   switch (fact.kind) {
     case 'user': {
       if (fact.plugin) break
+      // The documentation channel is on as soon as the interview is armed
+      // through `grill-with-docs`: the gesture, its skill-invocation message, or
+      // the model loading the skill itself.
+      if (isDocsActivation(fact)) fold.docsMode = true
       if (fact.deactivation) break
       // Only the human answers a round. The host appends runtime-context
       // snapshots, skill catalogs and this plugin's own directive as
@@ -1354,9 +1637,14 @@ function stepFold(fold, fact) {
     case 'assistant': {
       if (fact.confirms) fold.claimedSharedUnderstanding = true
       if (fact.announcesDone) fold.claimedDone = true
+      if (asArray(fact.skillLoad).some(isDocsSkillName)) fold.docsMode = true
       for (const install of fact.installs) {
         if (!fold.installs.some((entry) => entry.spec === install.spec)) fold.installs.push(install)
       }
+      // Declarations first, then the writes in the same message: a model that
+      // declares and writes in one step nets out to a paid debt.
+      declareDocs(fold, fact)
+      payDocs(fold, fact)
       if (fact.questions.length > 0) {
         if (restatesNewestRound(fold, fact.questions)) {
           // Seen again, not asked again: keep the round that already exists.
@@ -1394,10 +1682,16 @@ function stepFold(fold, fact) {
       } else if (fact.toolNames.length > 0 || fact.installs.length > 0) {
         flagAction(fold, fact, fact.toolNames)
       }
+      flagDocViolation(fold, fact, fact.toolNames)
       break
     }
     case 'tool-call': {
-      if (fact.name) flagAction(fold, fact, [fact.name])
+      if (asArray(fact.skillLoad).some(isDocsSkillName)) fold.docsMode = true
+      if (asArray(fact.writePaths).length > 0) payDocs(fold, fact)
+      if (fact.name) {
+        flagAction(fold, fact, [fact.name])
+        flagDocViolation(fold, fact, [fact.name])
+      }
       break
     }
     default:
@@ -1448,6 +1742,14 @@ function summarizeFold(fold, activationSeq) {
   // (GRILL-28). The frontier is already empty on this path, so a bare token cannot
   // be an answer to an open question.
   //
+  // The documentation channel (grill-with-docs). None of this can fire in the
+  // plain modes: `docsMode` only latches on an activation through the docs entry
+  // point, and a declaration in a mode without the channel is never booked.
+  const docsMode = fold.docsMode === true
+  const docDebts = fold.docDebts.map((debt) => ({ ...debt }))
+  const openDocDebts = docDebts.filter((debt) => debt.dischargedAtSeq === undefined)
+  const docsPending = docsMode && openDocDebts.length > 0
+
   // The confirmation belongs to the message that carried it, not to "whatever the
   // newest message happens to be" (GRILL-30): it stands until something is settled
   // after it — a new round the user answered — or a newer acceptance replaces it.
@@ -1458,6 +1760,9 @@ function summarizeFold(fold, activationSeq) {
   const confirmedUnderstanding =
     frontierEmpty &&
     acceptanceStands &&
+    // A declared document that was never written keeps the interview open: the
+    // hand-off to implementation is what the debt is owed before.
+    !docsPending &&
     (fold.lastAcceptBare ||
       (fold.lastAcceptRitual && (fold.claimedSharedUnderstanding || fold.claimedDone)))
 
@@ -1466,7 +1771,9 @@ function summarizeFold(fold, activationSeq) {
     : confirmedUnderstanding
       ? 'confirmed'
       : frontierEmpty
-        ? 'awaiting-confirmation'
+        ? docsPending
+          ? 'awaiting-docs'
+          : 'awaiting-confirmation'
         : rounds.length > 0
           ? 'rounds-complete'
           : 'active'
@@ -1503,12 +1810,22 @@ function summarizeFold(fold, activationSeq) {
     // or a reply has been recorded against it. A round that was just asked has
     // neither, which is exactly the difference the directive depends on.
     anyAnswerSinceRound: Boolean(latestRound && (latestRound.answered || latestRound.answerExcerpt)),
+    // Whether the human's acceptance is still standing (the documentation gate
+    // asks the same question when it explains what is left to do).
+    acceptanceStands,
     confirmedUnderstanding,
     // Evidence for the live check: the seq of the human message the confirmation
     // came from. It stays put while later chatter arrives (GRILL-30).
     confirmedAtSeq: confirmedUnderstanding ? fold.lastAcceptSeq : undefined,
     actionsAfterRound: fold.actionsAfterRound.map((action) => ({ ...action })),
     installs: [...fold.installs],
+    // The documentation channel: which mode the interview is in, what the
+    // interviewer promised to write, what is still missing, and every step that
+    // ran on to the work while a promise was outstanding.
+    docsMode,
+    docDebts,
+    openDocDebts,
+    docViolations: fold.docViolations.map((violation) => ({ ...violation })),
     claimedDone: fold.claimedDone,
     claimedSharedUnderstanding: fold.claimedSharedUnderstanding,
     evidence: [...fold.evidence],
@@ -1645,6 +1962,28 @@ function renderQuestion(question, index) {
 }
 
 /**
+ * Append the documentation-channel debt note, when there is one.
+ *
+ * It gets its own block because it contradicts the surrounding "do NOT run
+ * mutating tools" for exactly one tool class: writing the interview's own
+ * documents is part of the interview, not acting on the design.
+ *
+ * @param lines - directive lines being built.
+ * @param state - state from {@link analyze}.
+ * @returns {void}
+ */
+function pushDocDebtLines(lines, state) {
+  if (!state?.docsMode || state.openDocDebts.length === 0) return
+  lines.push('')
+  lines.push(
+    `Documentation channel (grill-with-docs): ${state.openDocDebts.length} declared document(s) are still unwritten.`,
+  )
+  for (const debt of state.openDocDebts) lines.push(`- [${debt.kind}] ${debt.title}`)
+  lines.push('Writing `docs/adr/**` or `**/GLOSSARY.md` is part of the interview and stays allowed even')
+  lines.push('now; nothing else is, and the hand-off is blocked until every one of them exists.')
+}
+
+/**
  * The directive to append to one model step, or `null` when the protocol needs
  * no reminder in this step.
  *
@@ -1674,6 +2013,7 @@ export function renderDirective(state) {
         lines.push(renderQuestion(question, index))
         lines.push('')
       })
+      pushDocDebtLines(lines, state)
       lines.push('This step: do NOT start new work, run mutating tools, or open a new round. The')
       lines.push('whole frontier of this round was already asked, so nothing is left to ask until the')
       lines.push("user's answers land. If this step was triggered by something other than the user's")
@@ -1699,12 +2039,42 @@ export function renderDirective(state) {
       lines.push(renderQuestion(question, index))
       lines.push('')
     })
+    pushDocDebtLines(lines, state)
     lines.push('This step: do NOT start new work, run mutating tools, or re-ask the settled questions.')
     lines.push('If the user answered, re-ask ONLY the questions still open above — numbered, each with a')
     lines.push('recommended answer — and stop. If this step was not triggered by the user, wait.')
     return lines.join('\n')
   }
   if (state.frontierEmpty) {
+    // The documentation channel's own terminal state: the design is settled but
+    // the papers are not written. This is the directive upstream's bug report
+    // asks for — the outer loop must not be able to swallow the write half.
+    if (state.docsMode && state.openDocDebts.length > 0) {
+      lines.push('Grilling is ACTIVE — every question asked so far is answered, but the documentation')
+      lines.push('channel still owes what the interviewer declared. The interview is not finished')
+      lines.push('until those files are on disk.')
+      lines.push('')
+      lines.push('Outstanding documents (declared with 📄, no write has paid them off yet):')
+      for (const debt of state.openDocDebts) {
+        const where =
+          debt.turn === undefined
+            ? ''
+            : ` (declared turn ${debt.turn}${debt.step === undefined ? '' : `, step ${debt.step}`})`
+        lines.push(`- [${debt.kind}] ${debt.title}${where}`)
+      }
+      lines.push('')
+      if (state.acceptanceStands) {
+        lines.push('This step: write every outstanding document now — each ADR to `docs/adr/NNNN-slug.md`,')
+        lines.push('each glossary entry to `GLOSSARY.md`, in prose and then the file itself. The user has')
+        lines.push('already confirmed the shared understanding, so the hand-off happens the moment the')
+        lines.push('last document is written — and not before.')
+      } else {
+        lines.push('This step: write every outstanding document now — each ADR to `docs/adr/NNNN-slug.md`,')
+        lines.push('each glossary entry to `GLOSSARY.md` — and only then ask the user to confirm the shared')
+        lines.push('understanding. The implementation may not start before both.')
+      }
+      return lines.join('\n')
+    }
     lines.push('Grilling is ACTIVE — every question asked so far is answered, so the frontier of')
     lines.push('the current branch is empty.')
     const stats = state.questionStats
@@ -1721,6 +2091,7 @@ export function renderDirective(state) {
   }
   lines.push(`Grilling is ACTIVE — ${state.roundCount} round(s) so far, no round is open.`)
   lines.push('')
+  pushDocDebtLines(lines, state)
   lines.push('This step: work the design tree in rounds — ask the whole frontier as numbered')
   lines.push('questions, each with your recommended answer, then WAIT for the user.')
   return lines.join('\n')
@@ -1752,6 +2123,16 @@ export function renderStatus(state) {
       `questions: total=${stats.total} open=${stats.open} accepted=${stats.accepted} overridden=${stats.overridden} batch=${stats.batch}`,
     )
   }
+  if (state.docsMode) {
+    lines.push(
+      `documentation channel: on — ${state.docDebts.length} declared, ${state.openDocDebts.length} outstanding`,
+    )
+    for (const debt of state.docDebts) {
+      const state_ =
+        debt.dischargedAtSeq === undefined ? '[outstanding]' : `[written: ${debt.dischargedPath}]`
+      lines.push(`- [${debt.kind}] ${debt.title} ${state_}`)
+    }
+  }
   if (state.waitingForAnswers) {
     lines.push('')
     lines.push(`Open round (turn ${state.waitingForAnswers.turn ?? '?'}):`)
@@ -1766,9 +2147,10 @@ export function renderStatus(state) {
     lines.push('The interviewer proposed installs:')
     for (const install of state.installs) lines.push(`- ${install.command} ${install.spec}`)
   }
-  if (state.actionsAfterRound.length > 0) {
+  if (state.actionsAfterRound.length > 0 || state.docViolations.length > 0) {
     lines.push('')
-    lines.push(`Protocol violations recorded: ${state.actionsAfterRound.length}`)
+    const total = state.actionsAfterRound.length + state.docViolations.length
+    lines.push(`Protocol violations recorded: ${total}`)
   }
   return lines.join('\n')
 }
@@ -1808,6 +2190,28 @@ function violatedRound(state, violation) {
 function violationIsLive(state, violation, currentTurn) {
   const round = violatedRound(state, violation)
   if (round === undefined || round.answered) return false
+  if (currentTurn === undefined || currentTurn === null) return true
+  if (violation.turn === undefined || violation.turn === null) return false
+  return violation.turn === currentTurn
+}
+
+/**
+ * Whether a documentation breach is still worth correcting.
+ *
+ * The same two questions as {@link violationIsLive}, with the debt in the place
+ * of the round: the debt must still be outstanding (writing the file ends the
+ * breach — the recovery happened), and the act must belong to the turn that is
+ * ending. The debt itself is the live part, which is why this does not go stale
+ * the way a recorded act does.
+ *
+ * @param state       - state from {@link analyze}.
+ * @param violation   - an entry of `state.docViolations`.
+ * @param currentTurn - the turn that is ending, when the caller knows it.
+ * @returns `true` when a correction is still true at delivery time.
+ */
+function docViolationIsLive(state, violation, currentTurn) {
+  if (state?.docsMode !== true) return false
+  if (state.openDocDebts.length === 0) return false
   if (currentTurn === undefined || currentTurn === null) return true
   if (violation.turn === undefined || violation.turn === null) return false
   return violation.turn === currentTurn
@@ -1868,6 +2272,11 @@ export function violationKey(state, currentTurn) {
     if (!violationIsLive(state, violation, currentTurn)) return null
     return `action:${violation.seq ?? 'unknown'}`
   }
+  if (state.docViolations.length > 0) {
+    const violation = state.docViolations[state.docViolations.length - 1]
+    if (!docViolationIsLive(state, violation, currentTurn)) return null
+    return `docs:${violation.seq ?? 'unknown'}`
+  }
   const badRound = state.rounds.find(
     (round) =>
       !round.answered &&
@@ -1920,6 +2329,32 @@ export function describeViolation(state) {
     ].join('\n')
   }
 
+  if (state.docViolations.length > 0) {
+    const violation = state.docViolations[state.docViolations.length - 1]
+    if (!docViolationIsLive(state, violation)) return null
+    const debts = state.openDocDebts
+    return [
+      CORRECTION_MARKER,
+      `Protocol violation: ${violation.note}.`,
+      '',
+      `You ran ${violation.toolNames.join(', ')} while the documentation channel still owed ${debts.length} document(s):`,
+      ...debts.map((debt) => `- [${debt.kind}] ${debt.title}`),
+      '',
+      'grill-with-docs settles the design *and* writes it down: a term goes into the glossary as it',
+      'settles, and the ADR for a decision is written before the work that implements it starts.',
+      'Nothing you declared with 📄 may still be unwritten when you begin implementing — that silent',
+      'missing write is the exact failure this channel exists to prevent.',
+      '',
+      'Recover now, in this step:',
+      '1. Undo nothing silently — state plainly that the work above ran ahead of the documents.',
+      '2. Write every outstanding document now, one at a time, in prose and then the file itself.',
+      '3. Do not resume the implementation until every one of them is on disk.',
+      '',
+      ...rules.slice(0, 3).map((rule) => `- ${rule}`),
+      '- A declared document is a debt: writing `docs/adr/NNNN-slug.md` or `**/GLOSSARY.md` is the only way to pay it.',
+    ].join('\n')
+  }
+
   if (state.rounds.length === 0) return null
 
   // Only a round that is still waiting for the user is worth correcting: an
@@ -1952,16 +2387,23 @@ export default {
   DIRECTIVE_MARKER,
   CORRECTION_MARKER,
   SOURCE_KIND,
+  DOC_MARKER,
+  DOCS_PRIMITIVE_NAME,
+  DOCS_WRAPPER_NAME,
   analyze,
+  classifyDocPath,
   correctionDelivered,
   createProjector,
   describeViolation,
+  docSlug,
   isAffirmativeAll,
   isPluginMessage,
   isReadOnlyTool,
+  isWriteTool,
   makeUserMessage,
   messageText,
   parseAnswers,
+  parseDocDeclarations,
   parseInstalls,
   parseQuestions,
   projectEvents,

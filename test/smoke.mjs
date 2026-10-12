@@ -187,21 +187,34 @@ await test('plugin exports name/inject and returns disposers', () => {
   assert.equal(name, 'grill-me')
   assert.deepEqual(inject, ['skills', 'tools', 'commands'])
   assert.ok(Array.isArray(disposers))
-  assert.equal(disposers.length, 6, 'two skills + tool + command + two listeners')
+  assert.equal(disposers.length, 9, 'four skills + tool + two commands + two listeners')
 })
 
-await test('both skills register with upstream invocation policies', () => {
-  assert.equal(log.skills.length, 2)
+await test('all four skills register with upstream invocation policies', () => {
+  assert.equal(log.skills.length, 4)
   const wrapper = log.skills.find((skill) => skill.name === 'grill-me')
   const primitive = log.skills.find((skill) => skill.name === 'grilling')
+  const docsWrapper = log.skills.find((skill) => skill.name === 'grill-with-docs')
+  const docsPrimitive = log.skills.find((skill) => skill.name === 'domain-modeling')
   assert.ok(wrapper, 'wrapper skill missing')
   assert.ok(primitive, 'primitive skill missing')
+  assert.ok(docsWrapper, 'grill-with-docs skill missing')
+  assert.ok(docsPrimitive, 'domain-modeling skill missing')
   assert.deepEqual(wrapper.invocation, { modelInvocable: false, userInvocable: true })
   assert.deepEqual(primitive.invocation, { modelInvocable: true, userInvocable: true })
-  assert.equal(wrapper.provider, 'grill-me')
-  assert.equal(primitive.provider, 'grill-me')
-  assert.ok(wrapper.description.length > 0 && primitive.description.length > 0)
-  assert.ok(wrapper.content.length > 0 && primitive.content.length > 0)
+  // Upstream marks both wrappers `disable-model-invocation: true`; the two
+  // primitives are what a model is allowed to load on its own.
+  assert.deepEqual(docsWrapper.invocation, { modelInvocable: false, userInvocable: true })
+  assert.deepEqual(docsPrimitive.invocation, { modelInvocable: true, userInvocable: true })
+  for (const skill of [wrapper, primitive, docsWrapper, docsPrimitive]) {
+    assert.equal(skill.provider, 'grill-me')
+    assert.ok(skill.description.length > 0, `${skill.name} needs a description`)
+    assert.ok(skill.content.length > 0, `${skill.name} needs a body`)
+  }
+  // The docs channel is keyed on this exact name, so the registration and the
+  // state machine cannot drift apart silently (src/state.js isDocsSkillName).
+  assert.ok(docsWrapper.content.includes('📄'), 'the docs wrapper must document the declaration marker')
+  assert.ok(docsPrimitive.content.includes('GLOSSARY.md'), 'the docs primitive must name the glossary')
 })
 
 /* -- 2. tool + command --------------------------------------------- */
@@ -245,9 +258,9 @@ await test('grill_status never throws on an unreadable transcript', async () => 
 })
 
 await test('/grill-me command registers, arms, and reports status', () => {
-  assert.equal(log.commands.length, 1)
-  const command = log.commands[0]
-  assert.equal(command.name, 'grill-me')
+  assert.equal(log.commands.length, 2)
+  const command = log.commands.find((entry) => entry.name === 'grill-me')
+  assert.ok(command, 'the /grill-me command must be registered')
   assert.equal(typeof command.handler, 'function')
   assert.ok(command.description.length > 0)
 

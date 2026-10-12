@@ -1,8 +1,8 @@
 {
   "name": "dsh-plugin-grill-me",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "private": true,
-  "description": "把 mattpocock 的 grill-me / grilling 技能复刻成 DSH 里的确定性访谈状态机：两个技能、一个只读状态工具、逐步注入的 frontier 指令，以及违反协议时把模型拉回来的 turn gate。",
+  "description": "把 mattpocock 的 grill-me / grilling / grill-with-docs / domain-modeling 技能复刻成 DSH 里的确定性访谈状态机：四个技能、一个只读状态工具、逐步注入的 frontier 指令、违反协议时把模型拉回来的 turn gate，以及 grill-with-docs 模式下的文档欠账闸门（ADR / 术语表不落盘就不算谈完）。",
   "type": "module",
   "main": "lib/index.js",
   "files": [

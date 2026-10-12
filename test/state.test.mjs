@@ -1862,7 +1862,7 @@ if (!existsSync(GLUE_PATH)) {
 
   header('phase 2: glue registration (lib/index.js)');
 
-  await test('glue: exports the plugin shape and registers two skills, one tool and one command', async () => {
+  await test('glue: exports the plugin shape and registers four skills, one tool and two commands', async () => {
     assert.equal(GLUE.name, 'grill-me', 'the plugin must keep its stable name');
     assert.ok(Array.isArray(GLUE.inject), 'inject must be an array of service ids');
     for (const service of ['skills', 'tools', 'commands']) {
@@ -1875,15 +1875,21 @@ if (!existsSync(GLUE_PATH)) {
     assert.ok(disposers.some((d) => typeof d === 'function'), 'apply must hand back disposers');
 
     const skills = host.registered.skills;
-    assert.equal(skills.length, 2, 'the plugin registers exactly two skills');
-    assert.deepEqual(skills.map((s) => s.name).sort(), ['grill-me', 'grilling']);
+    assert.equal(skills.length, 4, 'the plugin registers exactly four skills');
+    assert.deepEqual(skills.map((s) => s.name).sort(), [
+      'domain-modeling',
+      'grill-me',
+      'grill-with-docs',
+      'grilling',
+    ]);
     const userOnly = skills.filter((s) => s.invocation && s.invocation.modelInvocable === false);
     const modelFacing = skills.filter((s) => s.invocation && s.invocation.modelInvocable === true);
-    assert.equal(userOnly.length, 1, 'the wrapper must be user-invocable only (it spawns the interview)');
-    assert.equal(modelFacing.length, 1, 'the primitive must stay model-invocable');
-    assert.equal(userOnly[0].invocation.userInvocable, true);
-    assert.equal(modelFacing[0].invocation.userInvocable, true);
+    assert.equal(userOnly.length, 2, 'both wrappers must be user-invocable only (they spawn the interview)');
+    assert.deepEqual(userOnly.map((s) => s.name).sort(), ['grill-me', 'grill-with-docs']);
+    assert.equal(modelFacing.length, 2, 'both primitives must stay model-invocable');
+    assert.deepEqual(modelFacing.map((s) => s.name).sort(), ['domain-modeling', 'grilling']);
     for (const skill of skills) {
+      assert.equal(skill.invocation.userInvocable, true);
       assert.ok(typeof skill.description === 'string' && skill.description.trim().length > 0, `${skill.name} needs a description`);
       assert.equal(typeof skill.provider, 'string');
     }
@@ -1896,11 +1902,12 @@ if (!existsSync(GLUE_PATH)) {
     assert.equal(tool.output?.schema?.type, 'string');
     assert.equal(tool.parameters?.type, 'object', 'register() stores parameters as JSON Schema, not as a property map');
 
-    assert.equal(host.registered.commands.length, 1, 'the plugin registers exactly one command');
-    const command = host.registered.commands[0];
-    assert.equal(command.name, 'grill-me');
-    assert.equal(typeof command.handler, 'function');
-    assert.ok(typeof command.input?.hint === 'string' && command.input.hint.trim().length > 0, 'a command needs a non-empty hint');
+    assert.equal(host.registered.commands.length, 2, 'the plugin registers exactly two commands');
+    assert.deepEqual(host.registered.commands.map((c) => c.name).sort(), ['grill-me', 'grill-with-docs']);
+    for (const command of host.registered.commands) {
+      assert.equal(typeof command.handler, 'function');
+      assert.ok(typeof command.input?.hint === 'string' && command.input.hint.trim().length > 0, 'a command needs a non-empty hint');
+    }
   });
 
   await test('glue: grill_status renders the state and never throws without a session', async () => {
@@ -2568,6 +2575,248 @@ await test('grill_status prints the per-question settlement', async () => {
   assert.match(text, /- Q1 Scope \[accepted\]/);
   assert.match(text, /- Q2 Storage \[open\]/);
   assert.match(text, /- Q3 Auth \[accepted\]/);
+});
+
+// ═══════════════════ the documentation channel (v5) ═══════════════════
+// `grill-with-docs` is the only mode that owes documents, and upstream's own docs
+// record the failure it exists to prevent: "the file write silently does not
+// happen". Every test below pins one link of the chain — the marker books a debt,
+// a write pays it, and the hand-off stays blocked while one is outstanding.
+header('the documentation channel (grill-with-docs, v5)');
+
+const DOCS_ROUND = q(1, 'Storage', 'How should the plan store its state?', 'Use JSON on disk');
+const ADR_DECL = '📄 ADR: Use JSON for storage';
+const TERM_DECL = '📄 术语: 决策树';
+
+const docsActivated = () => {
+  const t = T();
+  activate(t, 'grill-with-docs');
+  return t;
+};
+
+// One round, answered, then the user's confirmation: the frontier is empty and
+// the acceptance stands, so the *only* thing that can block the hand-off is the
+// documentation channel.
+const settledDocsInterview = () => {
+  const t = docsActivated();
+  t.assistant(DOCS_ROUND, { turn: 1, step: 1 });
+  t.user('1 yes', { kind: 'user' });
+  t.user('确认', { kind: 'user' });
+  return t;
+};
+
+await test('grilling never opens the documentation channel', () => {
+  const t = T();
+  activate(t);
+  t.assistant(DOCS_ROUND, { turn: 1, step: 1 });
+  t.user('1 yes', { kind: 'user' });
+  t.user('确认', { kind: 'user' });
+  const s = stateOf(t.events);
+  assert.equal(s.docsMode, false);
+  assert.equal(s.mode, 'confirmed');
+  assert.deepEqual(s.docDebts, []);
+  assert.match(S.renderDirective(s), /Grilling is COMPLETE/);
+});
+
+await test('grill-with-docs latches the channel without changing the interview itself', () => {
+  const t = docsActivated();
+  t.assistant(DOCS_ROUND, { turn: 1, step: 1 });
+  const s = stateOf(t.events);
+  assert.equal(s.docsMode, true, 'the docs entry point is what turns the channel on');
+  assert.equal(s.mode, 'awaiting-answers', 'asking and waiting is unchanged');
+  assert.deepEqual(s.docDebts, [], 'nothing is owed until something is declared');
+});
+
+await test('loading domain-modeling inside a grilling interview opens nothing', () => {
+  const t = T();
+  activate(t);
+  t.toolCall('skill', { name: 'domain-modeling' }, { turn: 1, step: 1 });
+  const s = stateOf(t.events);
+  assert.equal(s.docsMode, false, 'the primitive is documentation, not an interview mode');
+  assert.deepEqual(s.docDebts, []);
+});
+
+await test('a 📄 declaration books a debt, and an ADR write pays it', () => {
+  const t = settledDocsInterview();
+  t.assistant(`Settled.\n\n${ADR_DECL}`, { turn: 1, step: 2 });
+  let s = stateOf(t.events);
+  assert.deepEqual(
+    s.docDebts.map((debt) => [debt.kind, debt.title]),
+    [['adr', 'Use JSON for storage']],
+  );
+  assert.equal(s.openDocDebts.length, 1);
+  assert.equal(s.confirmedUnderstanding, false, 'a declared, unwritten document blocks the hand-off');
+  assert.equal(s.mode, 'awaiting-docs');
+  const directive = S.renderDirective(s);
+  assert.match(directive, /\[adr\] Use JSON for storage/);
+  assert.doesNotMatch(directive, /Grilling is COMPLETE/);
+
+  t.toolCall('write', { file_path: 'docs/adr/0001-use-json-storage.md' }, { turn: 1, step: 3 });
+  s = stateOf(t.events);
+  assert.equal(s.openDocDebts.length, 0, 'the write is the redemption');
+  assert.equal(s.docDebts[0].dischargedPath, 'docs/adr/0001-use-json-storage.md');
+  assert.equal(s.mode, 'confirmed');
+  assert.match(S.renderDirective(s), /Grilling is COMPLETE/);
+});
+
+await test('📄 术语 books a glossary debt, and only a GLOSSARY.md pays it', () => {
+  const t = settledDocsInterview();
+  t.assistant(TERM_DECL, { turn: 1, step: 2 });
+  let s = stateOf(t.events);
+  assert.deepEqual(s.docDebts.map((debt) => debt.kind), ['glossary']);
+  assert.equal(s.openDocDebts.length, 1);
+
+  t.toolCall('write', { file_path: 'src/glossary.js' }, { turn: 1, step: 3 });
+  s = stateOf(t.events);
+  assert.equal(s.openDocDebts.length, 1, 'a source file that merely says "glossary" is not a glossary');
+  assert.equal(s.docViolations.length, 1, 'writing code with the glossary unwritten is the breach');
+  assert.equal(s.confirmedUnderstanding, false, 'and the hand-off stays blocked');
+
+  t.toolCall('write', { file_path: 'docs/GLOSSARY.md' }, { turn: 1, step: 4 });
+  s = stateOf(t.events);
+  assert.equal(s.openDocDebts.length, 0);
+  assert.equal(s.confirmedUnderstanding, true, 'the breach is over once the document exists');
+});
+
+await test('a debt is paid by the file whose slug matches its title', () => {
+  const t = settledDocsInterview();
+  t.assistant('📄 ADR: Use JSON for storage', { turn: 1, step: 2 });
+  t.assistant('📄 ADR: Rate limiting', { turn: 1, step: 3 });
+  let s = stateOf(t.events);
+  assert.equal(s.openDocDebts.length, 2);
+
+  t.toolCall('write', { file_path: 'docs/adr/0002-rate-limiting.md' }, { turn: 1, step: 4 });
+  s = stateOf(t.events);
+  assert.deepEqual(
+    s.docDebts.filter((debt) => debt.dischargedAtSeq !== undefined).map((debt) => debt.title),
+    ['Rate limiting'],
+    'the matching title is paid, not the oldest debt',
+  );
+  assert.deepEqual(s.openDocDebts.map((debt) => debt.title), ['Use JSON for storage']);
+});
+
+await test('declaring the same document twice books one debt', () => {
+  const t = settledDocsInterview();
+  t.assistant(ADR_DECL, { turn: 1, step: 2 });
+  t.assistant(`Still owed, I know.\n\n${ADR_DECL}`, { turn: 1, step: 3 });
+  const s = stateOf(t.events);
+  assert.equal(s.docDebts.length, 1);
+  assert.equal(s.openDocDebts.length, 1);
+});
+
+await test('a declaration inside a fenced block or blockquote books nothing', () => {
+  const t = settledDocsInterview();
+  t.assistant('```\n📄 ADR: Quoted example\n```\n\n> 📄 术语: quoted term', { turn: 1, step: 2 });
+  const s = stateOf(t.events);
+  assert.deepEqual(s.docDebts, [], 'the protocol being quoted is not the protocol being used');
+  assert.equal(s.mode, 'confirmed');
+});
+
+await test('a 📄 declaration in a plain grilling interview books nothing', () => {
+  const t = T();
+  activate(t);
+  t.assistant(DOCS_ROUND, { turn: 1, step: 1 });
+  t.user('1 yes', { kind: 'user' });
+  t.user('确认', { kind: 'user' });
+  t.assistant(ADR_DECL, { turn: 1, step: 2 });
+  const s = stateOf(t.events);
+  assert.equal(s.docsMode, false);
+  assert.deepEqual(s.docDebts, []);
+  assert.equal(s.mode, 'confirmed', 'the plain modes stay exactly as they were');
+});
+
+await test('writing the documents is part of the interview, not acting after an unanswered round', () => {
+  const t = docsActivated();
+  t.assistant(DOCS_ROUND, { turn: 1, step: 1 });
+  // Upstream writes a term down the moment it settles, i.e. while the round is
+  // still open — so a document-only write must not be corrected for.
+  t.toolCall('write', { file_path: 'docs/GLOSSARY.md' }, { turn: 1, step: 2 });
+  let s = stateOf(t.events);
+  assert.equal(s.actionsAfterRound.length, 0);
+
+  // Anything else in the same position still is.
+  t.toolCall('pwsh', { command: 'npm test' }, { turn: 1, step: 3 });
+  s = stateOf(t.events);
+  assert.equal(s.actionsAfterRound.length, 1);
+});
+
+await test('a documentation breach produces a correction naming every outstanding debt', () => {
+  const t = settledDocsInterview();
+  t.assistant(ADR_DECL, { turn: 1, step: 2 });
+  t.toolCall('pwsh', { command: 'npm test' }, { turn: 1, step: 3 });
+  const s = stateOf(t.events);
+  assert.equal(s.docViolations.length, 1);
+  assert.equal(s.actionsAfterRound.length, 0, 'the round is answered: this is a documentation breach');
+
+  const key = S.violationKey(s, 1);
+  assert.equal(key, `docs:${s.docViolations[0].seq}`);
+  assert.equal(S.violationKey(s, 2), null, 'a correction belongs to the turn it happened in');
+
+  const text = S.describeViolation(s);
+  assert.ok(text, 'a breach must produce a correction');
+  assert.ok(text.startsWith(S.CORRECTION_MARKER));
+  assert.match(text, /documentation channel still owed 1 document\(s\)/);
+  assert.match(text, /- \[adr\] Use JSON for storage/);
+  assert.match(text, /Recover now, in this step:/);
+
+  const status = S.renderStatus(s);
+  assert.match(status, /mode=awaiting-docs/);
+  assert.match(status, /documentation channel: on — 1 declared, 1 outstanding/);
+  assert.match(status, /- \[adr\] Use JSON for storage \[outstanding\]/);
+  assert.match(status, /Protocol violations recorded: 1/);
+});
+
+await test('the directive lists the debts while a round is still open', () => {
+  const t = docsActivated();
+  t.assistant(DOCS_ROUND, { turn: 1, step: 1 });
+  t.assistant(TERM_DECL, { turn: 1, step: 2 });
+  const s = stateOf(t.events);
+  assert.equal(s.mode, 'awaiting-answers');
+  const directive = S.renderDirective(s);
+  assert.match(directive, /Documentation channel \(grill-with-docs\): 1 declared document\(s\) are still unwritten/);
+  assert.match(directive, /- \[glossary\] 决策树/);
+  assert.match(directive, /stays allowed even/, 'the write half is exempt from the wait');
+});
+
+await test('the /grill-with-docs command reports the channel through the glue', () => {
+  const host = fakeHost();
+  E2E_GLUE.apply(host.ctx, undefined);
+  const command = host.registered.commands.find((entry) => entry.name === 'grill-with-docs');
+  assert.ok(command, 'the docs command must be registered');
+  const t = settledDocsInterview();
+  t.assistant(ADR_DECL, { turn: 1, step: 2 });
+  host.events = t.events;
+  const out = command.handler({ agent: host.agent(), rawInput: '' });
+  assert.equal(out.kind, 'success');
+  assert.match(out.text, /documentation channel: on — 1 declared, 1 outstanding/);
+});
+
+await test('the injected directive blocks the hand-off until the declared document exists', async () => {
+  const host = fakeHost();
+  E2E_GLUE.apply(host.ctx, undefined);
+  const t = settledDocsInterview();
+  t.assistant(ADR_DECL, { turn: 1, step: 2 });
+  host.events = t.events;
+  const claimed = {
+    role: 'user',
+    content: [{ type: 'text', text: 'go on then' }],
+    source: { kind: 'user' },
+  };
+
+  const firstOut = await host.preStep({ kind: 'enter', messages: [claimed] });
+  const before = pluginOwned(firstOut.messages);
+  assert.equal(before.length, 1, 'exactly one directive reaches the model');
+  const text = textOfMessage(before[0]);
+  assert.match(text, /channel still owes what the interviewer declared/);
+  assert.match(text, /- \[adr\] Use JSON for storage/);
+  assert.doesNotMatch(text, /Grilling is COMPLETE/, 'the hand-off is the debt\'s to grant');
+
+  t.toolCall('write', { file_path: 'docs/adr/0001-use-json-storage.md' }, { turn: 1, step: 3 });
+  host.events = t.events;
+  const secondOut = await host.preStep({ kind: 'enter', messages: [claimed] });
+  const after = pluginOwned(secondOut.messages);
+  assert.equal(after.length, 1, 'the directive keeps reaching the model after the debt is paid');
+  assert.match(textOfMessage(after[0]), /Grilling is COMPLETE/);
 });
 
 afterAll();
