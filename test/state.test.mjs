@@ -2819,6 +2819,147 @@ await test('the injected directive blocks the hand-off until the declared docume
   assert.match(textOfMessage(after[0]), /Grilling is COMPLETE/);
 });
 
+header('the documentation channel: defects the adversarial review found (v6)');
+
+// An independent adversarial pass attacked the channel with 20 probes; these
+// tests are the six defects it found, each one a case where the gate either paid
+// the wrong document or accused a model that had written the right one.
+
+await test('a short title cannot steal the write that pays a longer one', () => {
+  const t = docsActivated();
+  t.assistant('📄 ADR: Use JSON', { turn: 1, step: 1 });
+  t.assistant('📄 ADR: Use JSON for storage', { turn: 1, step: 2 });
+  t.toolCall('write', { file_path: 'docs/adr/0007-use-json-for-storage.md' }, { turn: 1, step: 3 });
+  const s = stateOf(t.events);
+  assert.deepEqual(s.openDocDebts.map((debt) => debt.title), ['Use JSON']);
+  const paid = s.docDebts.find((debt) => debt.title === 'Use JSON for storage');
+  assert.equal(paid.dischargedPath, 'docs/adr/0007-use-json-for-storage.md');
+});
+
+await test('a title that only appears in the directory name pays nothing', () => {
+  const t = docsActivated();
+  t.assistant('📄 ADR: docs', { turn: 1, step: 1 });
+  t.assistant('📄 ADR: Redis cache', { turn: 1, step: 2 });
+  t.toolCall('write', { file_path: 'docs/adr/0002-redis-cache.md' }, { turn: 1, step: 3 });
+  const s = stateOf(t.events);
+  assert.deepEqual(
+    s.openDocDebts.map((debt) => debt.title),
+    ['docs'],
+    'the file is slugged by its own name, not by docs/adr',
+  );
+});
+
+await test('one file pays one debt when the host reports the write twice', () => {
+  const t = docsActivated();
+  t.assistant('📄 ADR: Alpha thing', { turn: 1, step: 1 });
+  t.assistant('📄 ADR: Beta thing', { turn: 1, step: 2 });
+  // The same call, reported both ways a host reports it: on the assistant message
+  // and as a tool/call event.
+  t.assistant('Writing it now.', {
+    turn: 1,
+    step: 3,
+    toolCalls: [{ name: 'write', arguments: { file_path: 'docs/adr/0005-beta-thing.md' } }],
+  });
+  t.toolCall('write', { file_path: 'docs/adr/0005-beta-thing.md' }, { turn: 1, step: 3 });
+  const s = stateOf(t.events);
+  assert.deepEqual(
+    s.openDocDebts.map((debt) => debt.title),
+    ['Alpha thing'],
+    'one file is one payment, however many events carry it',
+  );
+});
+
+await test('a nested multi_edit target pays the debt', () => {
+  const t = docsActivated();
+  t.assistant('📄 ADR: Use JSON', { turn: 1, step: 1 });
+  t.toolCall('multi_edit', { edits: [{ file_path: 'docs/adr/0003-use-json.md' }] }, { turn: 1, step: 2 });
+  const s = stateOf(t.events);
+  assert.equal(s.openDocDebts.length, 0, 'the target is nested, not top level');
+});
+
+await test('an apply_patch payload names the file it writes', () => {
+  const t = docsActivated();
+  t.assistant('📄 ADR: Use JSON', { turn: 1, step: 1 });
+  t.toolCall(
+    'apply_patch',
+    { input: '*** Begin Patch\n*** Add File: docs/adr/0004-use-json.md\n+body\n*** End Patch' },
+    { turn: 1, step: 2 },
+  );
+  const s = stateOf(t.events);
+  assert.equal(s.openDocDebts.length, 0, 'the path lives in the payload text');
+});
+
+await test('a write whose target cannot be read neither pays nor accuses', () => {
+  const t = settledDocsInterview();
+  t.assistant('📄 ADR: Use JSON', { turn: 1, step: 2 });
+  t.toolCall('write', { opaque: true }, { turn: 1, step: 3 });
+  const s = stateOf(t.events);
+  assert.equal(s.openDocDebts.length, 1, 'nothing was paid');
+  assert.deepEqual(s.docViolations, [], 'and nothing was accused: silence beats a false correction');
+});
+
+await test('a mention of /grill-with-docs opens nothing', () => {
+  const t = T();
+  activate(t);
+  t.user('最后记得用 /grill-with-docs 复查一遍文档', { kind: 'user' });
+  assert.equal(stateOf(t.events).docsMode, false, 'a sentence is not a mode');
+
+  const u = T();
+  activate(u);
+  u.injected('Available skills: grilling, /grill-with-docs, grill-me', 'skill-invocation', { form: 'instructions' });
+  assert.equal(stateOf(u.events).docsMode, false, 'a catalogue lists every skill; it opens nothing');
+});
+
+await test('a spent action violation no longer hides a live documentation breach', () => {
+  const t = docsActivated();
+  t.assistant(DOCS_ROUND, { turn: 1, step: 1 });
+  t.toolCall('pwsh', { command: 'echo hi' }, { turn: 1, step: 2 });
+  t.user('1 yes', { kind: 'user' });
+  t.assistant('📄 ADR: Use JSON', { turn: 2, step: 1 });
+  t.toolCall('pwsh', { command: 'echo again' }, { turn: 2, step: 2 });
+  const s = stateOf(t.events);
+  assert.equal(s.actionsAfterRound.length, 1, 'the early act is on the ledger');
+  assert.equal(s.docViolations.length, 1, 'so is the breach');
+  assert.match(String(S.violationKey(s, 2)), /^docs:/);
+  assert.match(String(S.describeViolation(s)), /documentation channel still owed/);
+});
+
+await test('a paid documentation breach no longer hides a round without recommendations', () => {
+  const t = docsActivated();
+  t.assistant(DOCS_ROUND, { turn: 1, step: 1 });
+  t.user('1 yes', { kind: 'user' });
+  t.assistant('📄 ADR: Use JSON', { turn: 1, step: 2 });
+  t.toolCall('pwsh', { command: 'echo hi' }, { turn: 1, step: 3 });
+  t.toolCall('write', { file_path: 'docs/adr/0001-use-json.md' }, { turn: 1, step: 4 });
+  // Two marks, no ➡️ anywhere: the round parses (a lone recommendation-less
+  // question would be dropped — `recommends === 0 && marks.length < 2`).
+  t.assistant('❓ **Q2** - **Where?**: Where?\n\n❓ **Q3** - **When?**: When?', { turn: 2, step: 1 });
+  const s = stateOf(t.events);
+  assert.equal(s.docViolations.length, 1, 'the breach is history once the file exists');
+  assert.equal(s.openDocDebts.length, 0);
+  assert.match(String(S.violationKey(s, 2)), /^round:/, 'the round still lacks a recommendation');
+});
+
+await test('the glossary map is documentation, but it pays no term', () => {
+  const t = settledDocsInterview();
+  t.assistant(TERM_DECL, { turn: 1, step: 2 });
+  t.toolCall('write', { file_path: 'GLOSSARY-MAP.md' }, { turn: 1, step: 3 });
+  const s = stateOf(t.events);
+  assert.equal(s.openDocDebts.length, 1, 'the index is not the glossary');
+  assert.deepEqual(s.docViolations, [], 'writing the index is not running on to the work');
+  assert.equal(s.mode, 'awaiting-docs');
+});
+
+await test('a step that writes both the document and the code nets out to a paid debt', () => {
+  const t = settledDocsInterview();
+  t.assistant('📄 ADR: Use JSON', { turn: 1, step: 2 });
+  t.toolCall('write', { file_path: 'docs/adr/0001-use-json.md' }, { turn: 1, step: 3 });
+  t.toolCall('write', { file_path: 'src/app.js' }, { turn: 1, step: 3 });
+  const s = stateOf(t.events);
+  assert.deepEqual(s.docViolations, [], 'the document exists by the end of the step');
+  assert.equal(s.mode, 'confirmed');
+});
+
 afterAll();
 
 function afterAll() {

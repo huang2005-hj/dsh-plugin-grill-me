@@ -997,16 +997,20 @@ export function isWriteTool(name) {
 /**
  * What kind of document a write target is, or `null` for anything else.
  *
- * Upstream's layout, verbatim: an ADR is `docs/adr/NNNN-slug.md`, and a glossary
- * is always a file named `GLOSSARY.md` (one per context, hence "any path
- * segment"). Separators are normalized because the transcript carries whatever
- * the host recorded.
+ * Upstream's layout, verbatim: an ADR is `docs/adr/NNNN-slug.md`, a glossary is
+ * always a file named `GLOSSARY.md` (one per context, hence "any path segment"),
+ * and the multi-context index is `GLOSSARY-MAP.md`. Separators are normalized
+ * because the transcript carries whatever the host recorded.
+ *
+ * `glossary-map` is documentation — writing it is never "running on to the work"
+ * — but it is not a debt payment: only a `GLOSSARY.md` settles a term.
  */
 export function classifyDocPath(path) {
   if (typeof path !== 'string' || path.length === 0) return null
   const normalized = path.replace(/\\/g, '/').toLowerCase()
   if (/(?:^|\/)docs\/adr\/[^/]+$/.test(normalized)) return 'adr'
   if (/(?:^|\/)glossary\.md$/.test(normalized)) return 'glossary'
+  if (/(?:^|\/)glossary-map\.md$/.test(normalized)) return 'glossary-map'
   return null
 }
 
@@ -1024,6 +1028,22 @@ export function docSlug(title) {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 60)
+}
+
+/**
+ * Slug of the *file* a path points at — its own name, never the directories.
+ *
+ * Matching a declared title against the whole path was wrong: a path
+ * `docs/adr/0002-redis-cache.md` slugged whole reads `docs-adr-0002-redis-cache-md`,
+ * so a debt titled "docs" swallowed every ADR write. The stem keeps the two
+ * halves comparable, and the leading `NNNN-` that upstream's ADR naming adds is
+ * dropped so `0007-use-json-for-storage.md` still matches "Use JSON for storage".
+ */
+export function docFileSlug(path) {
+  const normalized = String(path ?? '').replace(/\\/g, '/')
+  const base = normalized.slice(normalized.lastIndexOf('/') + 1)
+  const stem = base.replace(/\.[a-z0-9]+$/i, '')
+  return docSlug(stem.replace(/^\d{2,4}-+/, ''))
 }
 
 /**
@@ -1049,13 +1069,93 @@ export function parseDocDeclarations(text) {
   return out
 }
 
+/** Patch payloads name their files in the diff text, not in an argument key. */
+const PATCH_HEADER_RES = [
+  /^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm,
+  /^diff --git a\/.+? b\/(.+)$/gm,
+  /^\+\+\+ b\/(.+)$/gm,
+]
+
+/** A tool whose file targets live inside its payload text. */
+function isPatchTool(name) {
+  if (typeof name !== 'string') return false
+  return /^(?:apply_?patch|patch)$/.test(name.trim().toLowerCase())
+}
+
+/** Paths named by a patch payload's own headers. */
+function patchPathsOf(text) {
+  const out = []
+  for (const re of PATCH_HEADER_RES) {
+    for (const match of String(text).matchAll(re)) {
+      const value = match[1].trim()
+      if (value.length > 0) out.push(value)
+    }
+  }
+  return out
+}
+
+/**
+ * Every path-looking value anywhere in one tool call's arguments.
+ *
+ * Argument shapes differ per host and per tool: `multi_edit` nests its edits as
+ * `edits: [{ file_path }]`, and `apply_patch` carries the path inside its payload
+ * string. Both were invisible to a top-level key scan, which left the debt
+ * unpaid and — worse — had the gate accuse a model that had in fact written the
+ * file (F2). The walk is depth-limited and key-driven, so it stays a path
+ * extractor rather than a general object scanner.
+ */
+function collectWritePaths(node, out, depth) {
+  if (node === null || node === undefined || depth > 6) return
+  if (typeof node === 'string') {
+    if (isPatchText(node)) for (const path of patchPathsOf(node)) out.push(path)
+    return
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) collectWritePaths(item, out, depth + 1)
+    return
+  }
+  if (typeof node !== 'object') return
+  for (const [key, value] of Object.entries(node)) {
+    if (typeof value === 'string' && value.trim().length > 0 && PATH_ARG_KEYS.includes(key)) {
+      out.push(value.trim())
+      continue
+    }
+    collectWritePaths(value, out, depth + 1)
+  }
+}
+
+/** Whether a string is written in patch-header form. */
+function isPatchText(text) {
+  return /^\*\*\* (?:Add|Update|Delete) File: /m.test(text) || /^\+\+\+ b\//m.test(text)
+}
+
 /** The document paths one tool call writes (empty for everything else). */
 function writePathsOf(name, args) {
-  if (!isWriteTool(name) || args === null || typeof args !== 'object') return []
+  if (!isWriteTool(name)) return []
   const out = []
-  for (const key of PATH_ARG_KEYS) {
-    const value = args[key]
-    if (typeof value === 'string' && value.trim().length > 0) out.push(value.trim())
+  if (typeof args === 'string') {
+    if (isPatchText(args)) out.push(...patchPathsOf(args))
+    return uniquePaths(out)
+  }
+  if (args === null || typeof args !== 'object') return []
+  collectWritePaths(args, out, 0)
+  if (isPatchTool(name)) {
+    for (const value of Object.values(args)) {
+      if (typeof value === 'string') out.push(...patchPathsOf(value))
+    }
+  }
+  return uniquePaths(out)
+}
+
+/** The same path written twice is one write (hosts report a call in two events). */
+function uniquePaths(paths) {
+  const out = []
+  const seen = new Set()
+  for (const path of paths) {
+    const key = path.replace(/\\/g, '/')
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(path)
   }
   return out
 }
@@ -1294,6 +1394,9 @@ function createFold(start) {
     docsMode: false,
     docDebts: [],
     docViolations: [],
+    // `turn:step\0path` keys already spent this step, so one written file pays
+    // exactly one debt however many events report it.
+    paidWrites: new Set(),
   }
 }
 
@@ -1523,11 +1626,19 @@ function docsOnlyWrite(fact, mutating) {
   return mutating.every((name) => isWriteTool(name))
 }
 
-/** Whether a user fact arms the interview through the documentation entry point. */
+/**
+ * Whether a user fact arms the interview through the documentation entry point.
+ *
+ * Only an actual entry point counts: a source that names the command or skill, a
+ * skill load the model performed, or a message that *is* the gesture (the slash
+ * command opening the message). A mention anywhere in prose does not — the
+ * catalogue a host injects lists every skill, and "remind me to run
+ * /grill-with-docs later" is a sentence, not a mode (F5).
+ */
 function isDocsActivation(fact) {
   if (asArray(fact.skillNames).some(isDocsSkillName)) return true
   if (asArray(fact.skillLoad).some(isDocsSkillName)) return true
-  return /\/grill-with-docs\b/i.test(strippedOf(fact.text ?? ''))
+  return /^\s*\/grill-with-docs\b/i.test(strippedOf(fact.text ?? ''))
 }
 
 /**
@@ -1562,20 +1673,40 @@ function declareDocs(fold, fact) {
 /**
  * Pay off debts from the paths one step wrote.
  *
- * Matching is by kind first, then by slug: the interviewer names a title and
- * chooses the file name, so a path whose slug contains the declared title pays
- * *that* debt, and otherwise the oldest outstanding one of the same kind does.
- * Nothing here judges the file's content — the gate is about the write
- * happening at all, which is the failure upstream's own docs record.
+ * Matching is by kind, then by the *file's own* slug: an exact hit wins, and
+ * otherwise the longest declared slug contained in it does, so a short title
+ * that happens to prefix a longer one can never steal the longer one's write
+ * (F1). Slugs too short to mean anything are ignored, and a path with no match
+ * at all still pays the oldest outstanding debt of its kind — the fallback that
+ * covers a Chinese title whose file name the model chose freely.
+ *
+ * One path pays at most one debt, and a path already paid in this step is spent:
+ * hosts report one tool call both on the assistant message and as a `tool/call`
+ * event (F3), and the second report used to settle a second debt off the same
+ * file, handing off `COMPLETE` with a document that was never written.
+ *
+ * Nothing here judges the file's content — the gate is about the write happening
+ * at all, which is the failure upstream's own docs record.
  */
 function payDocs(fold, fact) {
+  const stepKey = `${fact.turn ?? '?'}:${fact.step ?? '?'}`
   for (const path of asArray(fact.writePaths)) {
     const kind = classifyDocPath(path)
     if (kind === null) continue
+    const spent = `${stepKey}\u0000${path.replace(/\\/g, '/')}`
+    if (fold.paidWrites.has(spent)) continue
     const open = fold.docDebts.filter((debt) => debt.kind === kind && debt.dischargedAtSeq === undefined)
     if (open.length === 0) continue
-    const slug = docSlug(path)
-    const target = open.find((debt) => debt.slug.length >= 3 && slug.includes(debt.slug)) ?? open[0]
+    const fileSlug = docFileSlug(path)
+    let target = open.find((debt) => debt.slug.length >= 3 && debt.slug === fileSlug)
+    if (target === undefined) {
+      const contained = open
+        .filter((debt) => debt.slug.length >= 4 && fileSlug.includes(debt.slug))
+        .sort((a, b) => b.slug.length - a.slug.length)
+      target = contained[0]
+    }
+    if (target === undefined) target = open[0]
+    fold.paidWrites.add(spent)
     target.dischargedAtSeq = fact.seq
     target.dischargedPath = path
     fold.evidence.push({ seq: fact.seq, note: `documentation debt paid: ${target.kind} — ${target.title}` })
@@ -1598,6 +1729,10 @@ function flagDocViolation(fold, fact, toolNames) {
   const mutating = asArray(toolNames).filter((name) => !isReadOnlyTool(name))
   if (mutating.length === 0) return
   if (docsOnlyWrite(fact, mutating)) return
+  // A write tool whose target could not be read tells us nothing: paying is
+  // impossible and accusing would be guesswork. Silence is the safe direction —
+  // it misses a breach instead of inventing one (F2).
+  if (asArray(fact.writePaths).length === 0 && mutating.every((name) => isWriteTool(name))) return
   const stepKey = `doc:${fact.turn ?? '?'}:${fact.step ?? '?'}`
   if (fold.flaggedSteps.has(stepKey)) return
   fold.flaggedSteps.add(stepKey)
@@ -2267,15 +2402,16 @@ export function correctionDelivered(events, text) {
  */
 export function violationKey(state, currentTurn) {
   if (!state?.active || state.confirmedUnderstanding) return null
-  if (state.actionsAfterRound.length > 0) {
-    const violation = state.actionsAfterRound[state.actionsAfterRound.length - 1]
-    if (!violationIsLive(state, violation, currentTurn)) return null
-    return `action:${violation.seq ?? 'unknown'}`
+  // Each category is *skipped* when its newest entry is history, never treated
+  // as the end of the search: a spent action violation used to mask every later
+  // documentation breach, and a spent breach every later round defect (F6).
+  const action = state.actionsAfterRound[state.actionsAfterRound.length - 1]
+  if (action !== undefined && violationIsLive(state, action, currentTurn)) {
+    return `action:${action.seq ?? 'unknown'}`
   }
-  if (state.docViolations.length > 0) {
-    const violation = state.docViolations[state.docViolations.length - 1]
-    if (!docViolationIsLive(state, violation, currentTurn)) return null
-    return `docs:${violation.seq ?? 'unknown'}`
+  const breach = state.docViolations[state.docViolations.length - 1]
+  if (breach !== undefined && docViolationIsLive(state, breach, currentTurn)) {
+    return `docs:${breach.seq ?? 'unknown'}`
   }
   const badRound = state.rounds.find(
     (round) =>
@@ -2302,18 +2438,18 @@ export function describeViolation(state) {
 
   if (state.confirmedUnderstanding) return null
 
-  if (state.actionsAfterRound.length > 0) {
-    const violation = state.actionsAfterRound[state.actionsAfterRound.length - 1]
-    // GRILL-31: an act whose round has since been answered is history. The recovery
-    // steps below order the model to re-ask that round, which would manufacture a
-    // phantom round (GRILL-2) — so a settled violation says nothing at all.
-    if (!violationIsLive(state, violation)) return null
-    const acted = violation.installs.length > 0
-      ? `installed ${violation.installs.map((entry) => entry.spec).join(', ')}`
-      : `ran ${violation.toolNames.join(', ')}`
+  const actionViolation = state.actionsAfterRound[state.actionsAfterRound.length - 1]
+  // GRILL-31: an act whose round has since been answered is history. The recovery
+  // steps below order the model to re-ask that round, which would manufacture a
+  // phantom round (GRILL-2) — so a settled violation says nothing. It must not
+  // silence the *other* categories either (F6): fall through to the next one.
+  if (actionViolation !== undefined && violationIsLive(state, actionViolation)) {
+    const acted = actionViolation.installs.length > 0
+      ? `installed ${actionViolation.installs.map((entry) => entry.spec).join(', ')}`
+      : `ran ${actionViolation.toolNames.join(', ')}`
     return [
       CORRECTION_MARKER,
-      `Protocol violation: ${violation.note}.`,
+      `Protocol violation: ${actionViolation.note}.`,
       '',
       `You asked a round and then ${acted} instead of waiting for the answers.`,
       'grilling was still open: the user had not answered the pending round, and the protocol says',
@@ -2329,15 +2465,14 @@ export function describeViolation(state) {
     ].join('\n')
   }
 
-  if (state.docViolations.length > 0) {
-    const violation = state.docViolations[state.docViolations.length - 1]
-    if (!docViolationIsLive(state, violation)) return null
+  const docViolation = state.docViolations[state.docViolations.length - 1]
+  if (docViolation !== undefined && docViolationIsLive(state, docViolation)) {
     const debts = state.openDocDebts
     return [
       CORRECTION_MARKER,
-      `Protocol violation: ${violation.note}.`,
+      `Protocol violation: ${docViolation.note}.`,
       '',
-      `You ran ${violation.toolNames.join(', ')} while the documentation channel still owed ${debts.length} document(s):`,
+      `You ran ${docViolation.toolNames.join(', ')} while the documentation channel still owed ${debts.length} document(s):`,
       ...debts.map((debt) => `- [${debt.kind}] ${debt.title}`),
       '',
       'grill-with-docs settles the design *and* writes it down: a term goes into the glossary as it',
